@@ -33,7 +33,6 @@
 #include "monero_wallet_utils.hpp"
 #include <boost/algorithm/string.hpp>
 #include "cryptonote_basic.h"
-#include "device/device.hpp"
 #include "cryptonote_basic/account.h"
 #include "wallet_errors.h" // not crazy about including this but it's not that bad
 #include "keccak.h"
