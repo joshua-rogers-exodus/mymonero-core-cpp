@@ -50,6 +50,12 @@
 //
 #include "serial_bridge_utils.hpp"
 
+#ifdef __linux__
+#ifndef __ANDROID_API__
+#include <bsd/stdlib.h>
+#endif
+#endif
+
 using namespace std;
 using namespace boost;
 using namespace cryptonote;
