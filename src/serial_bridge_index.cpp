@@ -240,6 +240,7 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 			}
 		}
 
+		#ifndef EMSCRIPTEN
 		if (pruned_block.block_height >= oldest && pruned_block.block_height <= latest) continue;
 		if (size <= 100 || arc4random_uniform(100) < storage_rate) {
 			std::ofstream f;
@@ -254,6 +255,7 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 
 			f.close();
 		}
+		#endif
 	}
 
 	for (const auto& pair : wallet_accounts_params) {
@@ -454,6 +456,7 @@ std::string serial_bridge::build_rct(const rct::rctSig &rv, size_t index) {
 				epee::string_tools::pod_to_hex(rv.ecdhInfo[index].mask) +
 				epee::string_tools::pod_to_hex(rv.ecdhInfo[index].amount).substr(0, 16);
 		case rct::RCTTypeBulletproof2:
+		case rct::RCTTypeCLSAG:
 			return epee::string_tools::pod_to_hex(rv.outPk[index].mask) +
 				epee::string_tools::pod_to_hex(rv.ecdhInfo[index].amount).substr(0, 16);
 		default:
@@ -487,6 +490,8 @@ BridgeTransaction serial_bridge::json_to_tx(boost::property_tree::ptree tx_desc)
 		tx.rv.type = rct::RCTTypeBulletproof;
 	} else if (rv_type_int == rct::RCTTypeBulletproof2) {
 		tx.rv.type = rct::RCTTypeBulletproof2;
+	} else if (rv_type_int == rct::RCTTypeCLSAG) {
+		tx.rv.type = rct::RCTTypeCLSAG;
 	} else {
 		throw std::invalid_argument("Invalid 'tx_desc.rv.type'");
 	}
@@ -495,7 +500,7 @@ BridgeTransaction serial_bridge::json_to_tx(boost::property_tree::ptree tx_desc)
 	{
 		assert(ecdh_info_desc.first.empty()); // array elements have no names
 		auto ecdh_info = rct::ecdhTuple{};
-		if (tx.rv.type == rct::RCTTypeBulletproof2) {
+		if (tx.rv.type == rct::RCTTypeBulletproof2 || tx.rv.type == rct::RCTTypeCLSAG) {
 			if (!epee::string_tools::hex_to_pod(ecdh_info_desc.second.get<string>("amount"), (crypto::hash8&)ecdh_info.amount)) {
 				throw std::invalid_argument("Invalid 'tx_desc.rv.ecdhInfo[].amount'");
 			}
@@ -618,9 +623,9 @@ string serial_bridge::decode_amount(int version, crypto::key_derivation derivati
 		rct::key mask;
 		rct::xmr_amount decoded_amount;
 
-		if (rv.type == rct::RCTTypeNull) {
+		if (rv.type == rct::RCTTypeFull) {
 			decoded_amount = rct::decodeRct(rv, sk, index, mask, hw::get_device("default"));
-		} else if (rv.type == rct::RCTTypeSimple || rv.type == rct::RCTTypeFull || rv.type == rct::RCTTypeBulletproof || rv.type == rct::RCTTypeBulletproof2) {
+		} else if (rv.type == rct::RCTTypeSimple || rv.type == rct::RCTTypeBulletproof || rv.type == rct::RCTTypeBulletproof2 || rv.type == rct::RCTTypeBulletproof2 || rv.type == rct::RCTTypeCLSAG) {
 			decoded_amount = rct::decodeRctSimple(rv, sk, index, mask, hw::get_device("default"));
 		}
 
@@ -956,6 +961,7 @@ string serial_bridge::estimate_fee(const string &args_string)
 	int n_outputs = stoul(json_root.get<string>("n_outputs"));
 	size_t extra_size = stoul(json_root.get<string>("extra_size"));
 	bool bulletproof = json_root.get<bool>("bulletproof");
+	bool clsag = json_root.get<bool>("clsag");
 	uint64_t base_fee = stoull(json_root.get<string>("base_fee"));
 	uint64_t fee_quantization_mask = stoull(json_root.get<string>("fee_quantization_mask"));
 	uint32_t priority = stoul(json_root.get<string>("priority"));
@@ -963,7 +969,7 @@ string serial_bridge::estimate_fee(const string &args_string)
 	use_fork_rules_fn_type use_fork_rules_fn = monero_fork_rules::make_use_fork_rules_fn(fork_version);
 	uint64_t fee_multiplier = monero_fee_utils::get_fee_multiplier(priority, monero_fee_utils::default_priority(), monero_fee_utils::get_fee_algorithm(use_fork_rules_fn), use_fork_rules_fn);
 	//
-	uint64_t fee = monero_fee_utils::estimate_fee(use_per_byte_fee, use_rct, n_inputs, mixin, n_outputs, extra_size, bulletproof, base_fee, fee_multiplier, fee_quantization_mask);
+	uint64_t fee = monero_fee_utils::estimate_fee(use_per_byte_fee, use_rct, n_inputs, mixin, n_outputs, extra_size, bulletproof, clsag, base_fee, fee_multiplier, fee_quantization_mask);
 	//
 	std::ostringstream o;
 	o << fee;
@@ -985,8 +991,9 @@ string serial_bridge::estimate_tx_weight(const string &args_string)
 	int n_outputs = stoul(json_root.get<string>("n_outputs"));
 	size_t extra_size = stoul(json_root.get<string>("extra_size"));
 	bool bulletproof = json_root.get<bool>("bulletproof");
+	bool clsag = json_root.get<bool>("clsag");
 	//
-	uint64_t weight = monero_fee_utils::estimate_tx_weight(use_rct, n_inputs, mixin, n_outputs, extra_size, bulletproof);
+	uint64_t weight = monero_fee_utils::estimate_tx_weight(use_rct, n_inputs, mixin, n_outputs, extra_size, bulletproof, clsag);
 	//
 	std::ostringstream o;
 	o << weight;
@@ -1007,7 +1014,8 @@ string serial_bridge::estimate_rct_tx_size(const string &args_string)
 		stoul(json_root.get<string>("mixin")),
 		stoul(json_root.get<string>("n_outputs")),
 		stoul(json_root.get<string>("extra_size")),
-		json_root.get<bool>("bulletproof")
+		json_root.get<bool>("bulletproof"),
+		json_root.get<bool>("clsag")
 	);
 	std::ostringstream o;
 	o << size;
@@ -1253,6 +1261,8 @@ string serial_bridge::decodeRct(const string &args_string)
 		rv.type = rct::RCTTypeBulletproof;
 	} else if (rv_type_int == rct::RCTTypeBulletproof2) {
 		rv.type = rct::RCTTypeBulletproof2;
+	} else if (rv_type_int == rct::RCTTypeCLSAG) {
+		rv.type = rct::RCTTypeCLSAG;
 	} else {
 		return error_ret_json_from_message("Invalid 'rv.type'");
 	}
@@ -1326,6 +1336,8 @@ string serial_bridge::decodeRctSimple(const string &args_string)
 		rv.type = rct::RCTTypeBulletproof;
 	} else if (rv_type_int == rct::RCTTypeBulletproof2) {
 		rv.type = rct::RCTTypeBulletproof2;
+	} else if (rv_type_int == rct::RCTTypeCLSAG) {
+		rv.type = rct::RCTTypeCLSAG;
 	} else {
 		return error_ret_json_from_message("Invalid 'rv.type'");
 	}
@@ -1333,7 +1345,7 @@ string serial_bridge::decodeRctSimple(const string &args_string)
 	{
 		assert(ecdh_info_desc.first.empty()); // array elements have no names
 		auto ecdh_info = rct::ecdhTuple{};
-		if (rv.type == rct::RCTTypeBulletproof2) {
+		if (rv.type == rct::RCTTypeBulletproof2 || rv.type == rct::RCTTypeCLSAG) {
 			if (!epee::string_tools::hex_to_pod(ecdh_info_desc.second.get<string>("amount"), (crypto::hash8&)ecdh_info.amount)) {
 				return error_ret_json_from_message("Invalid rv.ecdhInfo[].amount");
 			}
