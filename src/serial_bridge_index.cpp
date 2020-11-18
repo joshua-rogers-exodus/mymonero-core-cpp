@@ -104,16 +104,17 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 	for (const auto& params_desc : json_root.get_child("params_by_wallet_account")) {
 		WalletAccountParams wallet_account_params;
 
-		if (!epee::string_tools::hex_to_pod(params_desc.second.get<string>("sec_viewKey_string"), wallet_account_params.sec_view_key)) {
+		if (!epee::string_tools::hex_to_pod(params_desc.second.get<string>("sec_viewKey_string"), wallet_account_params.account_keys.m_view_secret_key)) {
 			continue;
 		}
 
-		if (!epee::string_tools::hex_to_pod(params_desc.second.get<string>("pub_spendKey_string"), wallet_account_params.pub_spend_key)) {
+		if (!epee::string_tools::hex_to_pod(params_desc.second.get<string>("pub_spendKey_string"), wallet_account_params.account_keys.m_account_address.m_spend_public_key)) {
 			continue;
 		}
 
+		wallet_account_params.account_keys.m_spend_secret_key = crypto::null_skey;
 		auto secSpendKeyString = params_desc.second.get_optional<string>("sec_spendKey_string");
-		if (secSpendKeyString && !epee::string_tools::hex_to_pod(*secSpendKeyString, wallet_account_params.sec_spend_key)) {
+		if (secSpendKeyString && !epee::string_tools::hex_to_pod(*secSpendKeyString, wallet_account_params.account_keys.m_spend_secret_key)) {
 			continue;
 		}
 
@@ -133,6 +134,11 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 				wallet_account_params.gki.insert(std::pair<std::string, bool>(image_desc.second.get_value<std::string>(), true));
 			}
 		}
+
+		uint32_t subaddresses_count = params_desc.second.get<uint32_t>("subaddresses");
+
+		cryptonote::subaddress_index index = {0, 0};
+		expand_subaddresses(wallet_account_params.account_keys, wallet_account_params.subaddresses, index, subaddresses_count);
 
 		wallet_accounts_params.insert(std::make_pair(params_desc.first, wallet_account_params));
 	}
@@ -187,6 +193,7 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 			bridge_tx.block_height = height;
 			bridge_tx.rv = tx.rct_signatures;
 			bridge_tx.pub = get_extra_pub_key(fields);
+			bridge_tx.additional_pubs = get_extra_additional_tx_pub_keys(fields);
 			bridge_tx.fee_amount = get_fee(tx, bridge_tx);
 			bridge_tx.outputs = get_outputs(tx);
 
@@ -216,12 +223,7 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 					get_inputs_with_send_txs(tx, bridge_tx_copy, wallet_account_params.send_txs) :
 					get_inputs(tx, bridge_tx_copy, wallet_account_params.gki);
 
-				auto tx_utxos = extract_utxos_from_tx(
-					bridge_tx_copy,
-					wallet_account_params.sec_view_key,
-					wallet_account_params.sec_spend_key,
-					wallet_account_params.pub_spend_key
-				);
+				auto tx_utxos = extract_utxos_from_tx(bridge_tx_copy, wallet_account_params.account_keys, wallet_account_params.subaddresses);
 
 				for (size_t k = 0; k < tx_utxos.size(); k++) {
 					auto &utxo = tx_utxos[k];
@@ -259,7 +261,11 @@ NativeResponse serial_bridge::extract_data_from_blocks_response(const char *buff
 	}
 
 	for (const auto& pair : wallet_accounts_params) {
-		native_resp.txs_by_wallet_account.insert(std::make_pair(pair.first, pair.second.txs));
+		Result result;
+		result.subaddresses = pair.second.subaddresses.size();
+		result.txs = pair.second.txs;
+
+		native_resp.results_by_wallet_account.insert(std::make_pair(pair.first, result));
 	}
 
 	native_resp.current_height = resp.current_height;
@@ -286,10 +292,10 @@ std::string serial_bridge::extract_data_from_blocks_response_str(const char *buf
 	root.put("oldest", resp.oldest);
 	root.put("size", resp.size);
 
-	boost::property_tree::ptree txs_by_wallet_account_tree;
-	for (const auto& pair : resp.txs_by_wallet_account) {
+	boost::property_tree::ptree results_tree;
+	for (const auto& pair : resp.results_by_wallet_account) {
 		boost::property_tree::ptree txs_tree;
-		for (const auto& tx : pair.second) {
+		for (const auto& tx : pair.second.txs) {
 			boost::property_tree::ptree tx_tree;
 
 			tx_tree.put("id", tx.id);
@@ -310,10 +316,14 @@ std::string serial_bridge::extract_data_from_blocks_response_str(const char *buf
 			txs_tree.push_back(std::make_pair("", tx_tree));
 		}
 
-		txs_by_wallet_account_tree.add_child(pair.first, txs_tree);
+		boost::property_tree::ptree wallet_tree;
+		wallet_tree.add_child("txs", txs_tree);
+		wallet_tree.put("subaddresses", pair.second.subaddresses);
+
+		results_tree.add_child(pair.first, wallet_tree);
 	}
 
-	root.add_child("txs_by_wallet_account", txs_by_wallet_account_tree);
+	root.add_child("results", results_tree);
 
 	return ret_json_from_root(root);
 }
@@ -345,7 +355,7 @@ std::string serial_bridge::get_transaction_pool_hashes_str(const char *buffer, s
 }
 
 crypto::public_key serial_bridge::get_extra_pub_key(const std::vector<cryptonote::tx_extra_field> &fields) {
-	 for (size_t n = 0; n < fields.size(); ++n) {
+	for (size_t n = 0; n < fields.size(); ++n) {
 		if (typeid(cryptonote::tx_extra_pub_key) == fields[n].type()) {
 			return boost::get<cryptonote::tx_extra_pub_key>(fields[n]).pub_key;
 		}
@@ -354,8 +364,18 @@ crypto::public_key serial_bridge::get_extra_pub_key(const std::vector<cryptonote
 	return crypto::public_key{};
 }
 
+std::vector<crypto::public_key> serial_bridge::get_extra_additional_tx_pub_keys(const std::vector<cryptonote::tx_extra_field> &fields) {
+	for (size_t n = 0; n < fields.size(); ++n) {
+		if (typeid(cryptonote::tx_extra_additional_pub_keys) == fields[n].type()) {
+			return boost::get<cryptonote::tx_extra_additional_pub_keys>(fields[n]).data;
+		}
+	}
+
+	return {};
+}
+
 std::string serial_bridge::get_extra_nonce(const std::vector<cryptonote::tx_extra_field> &fields) {
-	 for (size_t n = 0; n < fields.size(); ++n) {
+	for (size_t n = 0; n < fields.size(); ++n) {
 		if (typeid(cryptonote::tx_extra_nonce) == fields[n].type()) {
 			return boost::get<cryptonote::tx_extra_nonce>(fields[n]).nonce;
 		}
@@ -566,6 +586,8 @@ boost::property_tree::ptree serial_bridge::utxos_to_json(std::vector<Utxo> utxos
 		out_ptree.put("vout", utxo.vout);
 		out_ptree.put("amount", utxo.amount);
 		out_ptree.put("key_image", utxo.key_image);
+		out_ptree.put("index_major", utxo.index.major);
+		out_ptree.put("index_minor", utxo.index.minor);
 
 		if (native) {
 			out_ptree.put("pub", epee::string_tools::pod_to_hex(utxo.pub));
@@ -604,10 +626,6 @@ boost::property_tree::ptree serial_bridge::pruned_block_to_json(const PrunedBloc
 	return block_tree;
 }
 
-bool serial_bridge::keys_equal(crypto::public_key a, crypto::public_key b)
-{
-	return equal(a.data, a.data + 32, b.data);
-}
 string serial_bridge::decode_amount(int version, crypto::key_derivation derivation, rct::rctSig rv, std::string amount, int index)
 {
 	if (version == 1) {
@@ -637,42 +655,85 @@ string serial_bridge::decode_amount(int version, crypto::key_derivation derivati
 
 	return "";
 }
-std::vector<Utxo> serial_bridge::extract_utxos_from_tx(BridgeTransaction tx, crypto::secret_key sec_view_key, crypto::secret_key sec_spend_key, crypto::public_key pub_spend_key)
+std::vector<Utxo> serial_bridge::extract_utxos_from_tx(BridgeTransaction tx, cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses)
 {
+	hw::device &hwdev = hw::get_device("default");
+
 	std::vector<Utxo> utxos;
 
 	crypto::key_derivation derivation = AUTO_VAL_INIT(derivation);
-	if (!crypto::generate_key_derivation(tx.pub, sec_view_key, derivation)) {
+	if (!crypto::generate_key_derivation(tx.pub, account_keys.m_view_secret_key, derivation)) {
 		return utxos;
 	}
 
-	BOOST_FOREACH(auto &output, tx.outputs)
-	{
-		crypto::public_key derived_key = AUTO_VAL_INIT(derived_key);
-		if (!crypto::derive_public_key(derivation, output.index, pub_spend_key, derived_key)) {
-			continue;
+	std::vector<crypto::key_derivation> additional_derivations;
+	for (const auto& pub : tx.additional_pubs) {
+		crypto::key_derivation additional_derivation = AUTO_VAL_INIT(additional_derivation);
+
+		if (!crypto::generate_key_derivation(pub, account_keys.m_view_secret_key, derivation)) {
+			return utxos;
 		}
 
-		if (!serial_bridge::keys_equal(output.pub, derived_key)) continue;
+		additional_derivations.push_back(additional_derivation);
+	}
+
+
+	BOOST_FOREACH(auto &output, tx.outputs)
+	{
+		boost::optional<subaddress_receive_info> subaddr_recv_info = is_out_to_acc_precomp(subaddresses, output.pub, derivation, additional_derivations, output.index, hwdev);
+		if (!subaddr_recv_info) continue;
 
 		Utxo utxo;
 		utxo.tx_id = tx.id;
+		utxo.index = subaddr_recv_info->index;
 		utxo.vout = output.index;
 		utxo.amount = serial_bridge::decode_amount(tx.version, derivation, tx.rv, output.amount, output.index);
 		utxo.tx_pub = tx.pub;
 		utxo.pub = output.pub;
 		utxo.rv = serial_bridge::build_rct(tx.rv, output.index);
 
-		if (sec_spend_key != crypto::null_skey) {
-			monero_key_image_utils::KeyImageRetVals retVals;
-			monero_key_image_utils::new__key_image(pub_spend_key, sec_spend_key, sec_view_key, tx.pub, output.index, retVals);
-			utxo.key_image = epee::string_tools::pod_to_hex(retVals.calculated_key_image);
+		if (account_keys.m_spend_secret_key != crypto::null_skey) {
+			cryptonote::keypair in_ephemeral;
+			crypto::key_image ki;
+
+			if(!generate_key_image_helper_precomp(account_keys, output.pub, subaddr_recv_info->derivation, output.index, subaddr_recv_info->index, in_ephemeral, ki, hwdev)) {
+				continue;
+			}
+
+			utxo.key_image = epee::string_tools::pod_to_hex(ki);
 		}
+
+		expand_subaddresses(account_keys, subaddresses, (*subaddr_recv_info).index);
 
 		utxos.push_back(utxo);
 	}
 
 	return utxos;
+}
+
+void serial_bridge::expand_subaddresses(cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses, const cryptonote::subaddress_index& tx_index, uint32_t lookahead) {
+	if (subaddresses.size() > (tx_index.minor + lookahead - 1)) return;
+
+	hw::device &hwdev = hw::get_device("default");
+
+	const uint32_t begin = subaddresses.size();
+	const uint32_t end = get_subaddress_clamped_sum(tx_index.minor, lookahead);
+
+	cryptonote::subaddress_index index = {0, begin};
+
+	const std::vector<crypto::public_key> pkeys = hwdev.get_subaddress_spend_public_keys(account_keys, index.major, index.minor, end);
+	for (; index.minor < end; index.minor++) {
+		const crypto::public_key &D = pkeys[index.minor];
+		subaddresses[D] = index;
+	}
+}
+
+uint32_t serial_bridge::get_subaddress_clamped_sum(uint32_t idx, uint32_t extra)
+{
+  static constexpr uint32_t uint32_max = std::numeric_limits<uint32_t>::max();
+  if (idx > uint32_max - extra)
+    return uint32_max;
+  return idx + extra;
 }
 //
 //
@@ -1211,6 +1272,7 @@ string serial_bridge::send_step2__try_create_transaction(const string &args_stri
 		stoull(json_root.get<string>("fee_per_b")),
 		stoull(json_root.get<string>("fee_mask")),
 		mix_outs,
+		json_root.get<uint32_t>("subaddresses"),
 		monero_fork_rules::make_use_fork_rules_fn(fork_version),
 		stoull(json_root.get<string>("unlock_time")),
 		nettype_from_string(json_root.get<string>("nettype_string"))
@@ -1515,20 +1577,25 @@ string serial_bridge::extract_utxos(const string &args_string)
 		return error_ret_json_from_message("Invalid JSON");
 	}
 
-	crypto::secret_key sec_view_key;
-	if (!epee::string_tools::hex_to_pod(json_root.get<string>("sec_viewKey_string"), sec_view_key)) {
+	cryptonote::account_keys account_keys;
+
+	if (!epee::string_tools::hex_to_pod(json_root.get<string>("sec_viewKey_string"), account_keys.m_view_secret_key)) {
 		return error_ret_json_from_message("Invalid 'sec_viewKey_string'");
 	}
 
-	crypto::secret_key sec_spend_key;
-	if (!epee::string_tools::hex_to_pod(json_root.get<string>("sec_spendKey_string"), sec_spend_key)) {
+	if (!epee::string_tools::hex_to_pod(json_root.get<string>("sec_spendKey_string"), account_keys.m_spend_secret_key)) {
 		return error_ret_json_from_message("Invalid 'sec_spendKey_string'");
 	}
 
-	crypto::public_key pub_spend_key;
-	if (!epee::string_tools::hex_to_pod(json_root.get<string>("pub_spendKey_string"), pub_spend_key)) {
+	if (!epee::string_tools::hex_to_pod(json_root.get<string>("pub_spendKey_string"), account_keys.m_account_address.m_spend_public_key)) {
 		return error_ret_json_from_message("Invalid 'pub_spendKey_string'");
 	}
+
+	uint32_t subaddresses_count = json_root.get<uint32_t>("subaddresses");
+
+	std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddresses;
+	cryptonote::subaddress_index index = {0, 0};
+	expand_subaddresses(account_keys, subaddresses, index, subaddresses_count);
 
 	std::vector<Utxo> utxos;
 	BOOST_FOREACH(boost::property_tree::ptree::value_type &tx_desc, json_root.get_child("txs"))
@@ -1537,7 +1604,7 @@ string serial_bridge::extract_utxos(const string &args_string)
 
 		try {
 			auto tx = serial_bridge::json_to_tx(tx_desc.second);
-			auto tx_utxos = serial_bridge::extract_utxos_from_tx(tx, sec_view_key, sec_spend_key, pub_spend_key);
+			auto tx_utxos = serial_bridge::extract_utxos_from_tx(tx, account_keys, subaddresses);
 			utxos.insert(std::end(utxos), std::begin(tx_utxos), std::end(tx_utxos));
 		} catch(std::invalid_argument err) {
 			return error_ret_json_from_message(err.what());
@@ -1546,5 +1613,6 @@ string serial_bridge::extract_utxos(const string &args_string)
 
 	boost::property_tree::ptree root;
 	root.add_child("outputs", serial_bridge::utxos_to_json(utxos));
+	root.put("subaddresses", subaddresses.size());
 	return ret_json_from_root(root);
 }

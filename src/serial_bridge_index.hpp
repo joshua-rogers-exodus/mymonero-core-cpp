@@ -37,9 +37,14 @@
 #include <boost/property_tree/ptree.hpp>
 #include "rpc/core_rpc_server_commands_defs.h"
 #include "cryptonote_config.h"
+#include "cryptonote_basic/account.h"
+#include "cryptonote_basic/subaddress_index.h"
 #include "cryptonote_basic/tx_extra.h"
 #include "crypto/crypto.h"
 #include "ringct/rctTypes.h"
+
+#define SUBADDRESS_LOOKAHEAD_MINOR 200
+
 //
 // See serial_bridge_utils.hpp
 //
@@ -56,6 +61,7 @@ namespace serial_bridge
 
 	struct UtxoBase {
 		string tx_id;
+		cryptonote::subaddress_index index;
 		uint8_t vout;
 		string amount;
 		string key_image;
@@ -76,6 +82,7 @@ namespace serial_bridge
 		uint64_t block_height;
 		rct::rctSig rv;
 		crypto::public_key pub;
+		std::vector<crypto::public_key> additional_pubs;
 		crypto::hash payment_id = crypto::null_hash;
 		crypto::hash8 payment_id8 = crypto::null_hash8;
 		rct::xmr_amount fee_amount = 0;
@@ -97,12 +104,16 @@ namespace serial_bridge
 	};
 
 	struct WalletAccountParams {
-		crypto::secret_key sec_view_key;
-		crypto::secret_key sec_spend_key = crypto::null_skey;
-		crypto::public_key pub_spend_key;
+		cryptonote::account_keys account_keys;
+		std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddresses;
 		bool has_send_txs = false;
 		std::map<std::string, bool> gki;
 		std::map<std::string, bool> send_txs;
+		std::vector<BridgeTransaction> txs;
+	};
+
+	struct Result {
+		uint32_t subaddresses;
 		std::vector<BridgeTransaction> txs;
 	};
 
@@ -110,7 +121,7 @@ namespace serial_bridge
 		std::string error;
 		uint64_t current_height;
 		uint64_t end_height = 0;
-		std::map<std::string, std::vector<BridgeTransaction>> txs_by_wallet_account;
+		std::map<std::string, Result> results_by_wallet_account;
 		uint64_t latest;
 		uint64_t oldest;
 		uint64_t size;
@@ -126,6 +137,7 @@ namespace serial_bridge
 	//
 	// Helper Functions
 	crypto::public_key get_extra_pub_key(const std::vector<cryptonote::tx_extra_field> &fields);
+	std::vector<crypto::public_key> get_extra_additional_tx_pub_keys(const std::vector<cryptonote::tx_extra_field> &fields);
 	std::string get_extra_nonce(const std::vector<cryptonote::tx_extra_field> &fields);
 	std::vector<crypto::key_image> get_inputs(const cryptonote::transaction &tx, const BridgeTransaction &bridge_tx, std::map<std::string, bool> &gki);
 	std::vector<crypto::key_image> get_inputs_with_send_txs(const cryptonote::transaction &tx, const BridgeTransaction &bridge_tx, std::map<std::string, bool> &send_txs);
@@ -136,9 +148,11 @@ namespace serial_bridge
 	boost::property_tree::ptree inputs_to_json(std::vector<crypto::key_image> inputs);
 	boost::property_tree::ptree utxos_to_json(std::vector<Utxo> utxos, bool native = false);
 	boost::property_tree::ptree pruned_block_to_json(const PrunedBlock &pruned_block);
-	bool keys_equal(crypto::public_key a, crypto::public_key b);
 	std::string decode_amount(int version, crypto::key_derivation derivation, rct::rctSig rv, std::string amount, int index);
-	std::vector<Utxo> extract_utxos_from_tx(BridgeTransaction tx, crypto::secret_key sec_view_key, crypto::secret_key sec_spend_key, crypto::public_key pub_spend_key);
+	std::vector<Utxo> extract_utxos_from_tx(BridgeTransaction tx, cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses);
+
+	void expand_subaddresses(cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses, const cryptonote::subaddress_index& index, uint32_t lookahead = SUBADDRESS_LOOKAHEAD_MINOR);
+	uint32_t get_subaddress_clamped_sum(uint32_t idx, uint32_t extra);
 
 	//
 	// Bridging Functions - these take and return JSON strings
