@@ -103,28 +103,42 @@ namespace serial_bridge
 		std::vector<Mixin> mixins;
 	};
 
-	struct WalletAccountParams {
+	struct WalletAccountParamsBase {
 		cryptonote::account_keys account_keys;
 		std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddresses;
+	};
+
+	struct WalletAccountParams : WalletAccountParamsBase {
 		bool has_send_txs = false;
 		std::map<std::string, bool> gki;
 		std::map<std::string, bool> send_txs;
+	};
+
+	struct ResultBase {
+		uint32_t subaddresses;
+	};
+
+	struct ExtractTransactionsResult : ResultBase {
 		std::vector<BridgeTransaction> txs;
 	};
 
-	struct Result {
-		uint32_t subaddresses;
-		std::vector<BridgeTransaction> txs;
+	struct ExtractUtxosResult : ResultBase {
+		std::vector<Utxo> utxos;
 	};
 
 	struct NativeResponse {
 		std::string error;
 		uint64_t current_height;
 		uint64_t end_height = 0;
-		std::map<std::string, Result> results_by_wallet_account;
+		std::map<std::string, ExtractTransactionsResult> results_by_wallet_account;
 		uint64_t latest;
 		uint64_t oldest;
 		uint64_t size;
+	};
+
+	struct ExtractUtxosResponse {
+		std::string error;
+		std::map<std::string, ExtractUtxosResult> results_by_wallet_account;
 	};
 
 	//
@@ -150,6 +164,8 @@ namespace serial_bridge
 	boost::property_tree::ptree pruned_block_to_json(const PrunedBlock &pruned_block);
 	std::string decode_amount(int version, crypto::key_derivation derivation, rct::rctSig rv, std::string amount, int index);
 	std::vector<Utxo> extract_utxos_from_tx(BridgeTransaction tx, cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses);
+
+	ExtractUtxosResponse extract_utxos_raw(const string &args_string);
 
 	void expand_subaddresses(cryptonote::account_keys account_keys, std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses, const cryptonote::subaddress_index& index, uint32_t lookahead = SUBADDRESS_LOOKAHEAD_MINOR);
 	uint32_t get_subaddress_clamped_sum(uint32_t idx, uint32_t extra);
