@@ -305,6 +305,16 @@ std::string serial_bridge::extract_data_from_blocks_response_str(const char *buf
 			tx_tree.put("timestamp", tx.timestamp);
 			tx_tree.put("height", tx.block_height);
 			tx_tree.put("pub", epee::string_tools::pod_to_hex(tx.pub));
+
+			boost::property_tree::ptree additional_pubs_tree;
+			for (const auto& pub : tx.additional_pubs) {
+				boost::property_tree::ptree value;
+				value.put("", epee::string_tools::pod_to_hex(pub));
+
+				additional_pubs_tree.push_back(std::make_pair("", value));
+			}
+			tx_tree.add_child("additional_pubs", additional_pubs_tree);
+
 			tx_tree.put("fee", tx.fee_amount);
 
 			if (tx.payment_id8 != crypto::null_hash8) {
@@ -604,6 +614,7 @@ boost::property_tree::ptree serial_bridge::utxos_to_json(std::vector<Utxo> utxos
 		out_ptree.put("key_image", utxo.key_image);
 		out_ptree.put("index_major", utxo.index.major);
 		out_ptree.put("index_minor", utxo.index.minor);
+		out_ptree.put("mask", epee::string_tools::pod_to_hex(utxo.mask));
 
 		if (native) {
 			out_ptree.put("pub", epee::string_tools::pod_to_hex(utxo.pub));
@@ -642,7 +653,7 @@ boost::property_tree::ptree serial_bridge::pruned_block_to_json(const PrunedBloc
 	return block_tree;
 }
 
-string serial_bridge::decode_amount(int version, crypto::key_derivation derivation, rct::rctSig rv, std::string amount, int index)
+string serial_bridge::decode_amount(int version, crypto::key_derivation derivation, rct::rctSig rv, std::string amount, int index, rct::key& mask)
 {
 	if (version == 1) {
 		return amount;
@@ -650,7 +661,6 @@ string serial_bridge::decode_amount(int version, crypto::key_derivation derivati
 		crypto::secret_key scalar;
 		hw::get_device("default").derivation_to_scalar(derivation, index, scalar);
 
-		rct::key mask;
 		rct::xmr_amount decoded_amount;
 
 		if (rv.type == rct::RCTTypeFull) {
@@ -699,7 +709,7 @@ std::vector<Utxo> serial_bridge::extract_utxos_from_tx(BridgeTransaction tx, cry
 		utxo.tx_id = tx.id;
 		utxo.index = subaddr_recv_info->index;
 		utxo.vout = output.index;
-		utxo.amount = serial_bridge::decode_amount(tx.version, subaddr_recv_info->derivation, tx.rv, output.amount, output.index);
+		utxo.amount = serial_bridge::decode_amount(tx.version, subaddr_recv_info->derivation, tx.rv, output.amount, output.index, utxo.mask);
 		utxo.tx_pub = tx.pub;
 		utxo.pub = output.pub;
 		utxo.rv = serial_bridge::build_rct(tx.rv, output.index);
@@ -1288,6 +1298,7 @@ string serial_bridge::send_step1__prepare_params_for_get_decoys(const string &ar
 	}
 	return ret_json_from_root(root);
 }
+
 string serial_bridge::send_step2__try_create_transaction(const string &args_string)
 {
 	boost::property_tree::ptree json_root;
@@ -1303,6 +1314,7 @@ string serial_bridge::send_step2__try_create_transaction(const string &args_stri
 		SpendableOutput out{};
 		out.amount = stoull(output_desc.second.get<string>("amount"));
 		out.public_key = output_desc.second.get<string>("public_key");
+		out.mask = output_desc.second.get<string>("mask");
 		out.rct = output_desc.second.get_optional<string>("rct");
 		if (out.rct != none && (*out.rct).empty() == true) {
 			out.rct = none; // send to 'none' if empty str for safety
@@ -1310,6 +1322,13 @@ string serial_bridge::send_step2__try_create_transaction(const string &args_stri
 		out.global_index = stoull(output_desc.second.get<string>("global_index"));
 		out.index = stoull(output_desc.second.get<string>("index"));
 		out.tx_pub_key = output_desc.second.get<string>("tx_pub_key");
+
+		for (const auto& additional_pub_desc : output_desc.second.get_child("additional_tx_pubs")) {
+			assert(additional_pub_desc.first.empty());
+
+			out.additional_tx_pubs.push_back(additional_pub_desc.second.get_value<std::string>());
+		}
+
 		//
 		using_outs.push_back(std::move(out));
 	}
@@ -1357,6 +1376,7 @@ string serial_bridge::send_step2__try_create_transaction(const string &args_stri
 		stoull(json_root.get<string>("unlock_time")),
 		nettype_from_string(json_root.get<string>("nettype_string"))
 	);
+
 	boost::property_tree::ptree root;
 	if (retVals.errCode != noError) {
 		root.put(ret_json_key__any__err_code(), retVals.errCode);
