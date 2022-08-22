@@ -196,7 +196,8 @@ void monero_transfer_utils::send_step1__prepare_params_for_get_decoys(
 	uint64_t fee_per_b, // per v8
 	uint64_t fee_quantization_mask,
 	//
-	optional<uint64_t> passedIn_attemptAt_fee
+	optional<uint64_t> prior_attempt_size_calcd_fee,
+	optional<SpendableOutputToRandomAmountOutputs> prior_attempt_unspent_outs_to_mix_outs
 ) {
 	retVals = {};
 	//
@@ -232,12 +233,12 @@ void monero_transfer_utils::send_step1__prepare_params_for_get_decoys(
 	const uint64_t fee_multiplier = get_fee_multiplier(simple_priority, default_priority(), get_fee_algorithm(use_fork_rules_fn), use_fork_rules_fn);
 	//
 	uint64_t attempt_at_min_fee;
-	if (passedIn_attemptAt_fee == none) {
-		attempt_at_min_fee = estimate_fee(true/*use_per_byte_fee*/, true/*use_rct*/, 2/*est num inputs*/, fake_outs_count, 2, extra.size(), bulletproof, clsag, base_fee, fee_multiplier, fee_quantization_mask);
-		// opted to do this instead of `const uint64_t min_fee = (fee_multiplier * base_fee * estimate_tx_size(use_rct, 1, fake_outs_count, 2, extra.size(), bulletproof));`
-		// TODO: estimate with 1 input or 2?
+	if (prior_attempt_size_calcd_fee == none) {
+		attempt_at_min_fee = estimate_fee(true/*use_per_byte_fee*/, true/*use_rct*/, 1/*est num inputs*/, fake_outs_count, 2, extra.size(), bulletproof, clsag, base_fee, fee_multiplier, fee_quantization_mask);
+		// use a minimum viable estimate_fee() with 1 input. It would be better to under-shoot this estimate, and then need to use a higher fee  from calculate_fee() because the estimate is too low,
+		// versus the worse alternative of over-estimating here and getting stuck using too high of a fee that leads to fingerprinting
 	} else {
-		attempt_at_min_fee = *passedIn_attemptAt_fee;
+		attempt_at_min_fee = *prior_attempt_size_calcd_fee;
 	}
 	struct Total
 	{
@@ -257,6 +258,20 @@ void monero_transfer_utils::send_step1__prepare_params_for_get_decoys(
 	// Gather outputs and amount to use for getting decoy outputs…
 	uint64_t using_outs_amount = 0;
 	vector<SpendableOutput>  remaining_unusedOuts = unspent_outs; // take copy so not to modify original
+
+	// start by using all the passed in outs that were selected in a prior tx construction attempt
+	if (prior_attempt_unspent_outs_to_mix_outs != none) {
+		for (size_t i = 0; i < remaining_unusedOuts.size(); ++i) {
+			SpendableOutput &out = remaining_unusedOuts[i];
+
+			// search for out by public key to see if it should be re-used in an attempt
+			if (prior_attempt_unspent_outs_to_mix_outs->find(out.public_key) != prior_attempt_unspent_outs_to_mix_outs->end()) {
+				using_outs_amount += out.amount;
+				retVals.using_outs.push_back(std::move(pop_index(remaining_unusedOuts, i)));
+			}
+		}
+	}
+
 	// TODO: factor this out to get spendable balance for display in the MM wallet:
 	while (using_outs_amount < potential_total && remaining_unusedOuts.size() > 0) {
 		auto out = pop_random_value(remaining_unusedOuts);
@@ -286,7 +301,7 @@ void monero_transfer_utils::send_step1__prepare_params_for_get_decoys(
 		bulletproof, clsag, base_fee, fee_multiplier, fee_quantization_mask
 	);
 	// if newNeededFee < neededFee, use neededFee instead (should only happen on the 2nd or later times through (due to estimated fee being too low))
-	if (needed_fee < attempt_at_min_fee) {
+	if (prior_attempt_size_calcd_fee != none && needed_fee < attempt_at_min_fee) {
 		needed_fee = attempt_at_min_fee;
 	}
 	//
@@ -350,6 +365,72 @@ void monero_transfer_utils::send_step1__prepare_params_for_get_decoys(
 //		// TODO?
 //	}
 }
+
+void monero_transfer_utils::pre_step2_tie_unspent_outs_to_mix_outs_for_all_future_tx_attempts(
+	Tie_Outs_to_Mix_Outs_RetVals &retVals,
+	//
+	const vector<SpendableOutput> &using_outs,
+	vector<RandomAmountOutputs> mix_outs_from_server,
+	//
+	const optional<SpendableOutputToRandomAmountOutputs> &prior_attempt_unspent_outs_to_mix_outs
+) {
+	retVals.errCode = noError;
+	//
+	// combine newly requested mix outs returned from the server, with the already known decoys from prior tx construction attempts,
+	// so that the same decoys will be re-used with the same outputs in all tx construction attempts. This ensures fee returned
+	// by calculate_fee() will be correct in the final tx, and also reduces number of needed trips to the server during tx construction.
+	SpendableOutputToRandomAmountOutputs prior_attempt_unspent_outs_to_mix_outs_new;
+	if (prior_attempt_unspent_outs_to_mix_outs) {
+		prior_attempt_unspent_outs_to_mix_outs_new = *prior_attempt_unspent_outs_to_mix_outs;
+	}
+
+	std::vector<RandomAmountOutputs> mix_outs;
+	mix_outs.reserve(using_outs.size());
+
+	for (size_t i = 0; i < using_outs.size(); ++i) {
+		auto out = using_outs[i];
+
+		// if we don't already know of a particular out's mix outs (from a prior attempt),
+		// then tie out to a set of mix outs retrieved from the server
+		if (prior_attempt_unspent_outs_to_mix_outs_new.find(out.public_key) == prior_attempt_unspent_outs_to_mix_outs_new.end()) {
+			for (size_t j = 0; j < mix_outs_from_server.size(); ++j) {
+				if ((out.rct != none && mix_outs_from_server[j].amount != 0) ||
+					(out.rct == none && mix_outs_from_server[j].amount != out.amount)) {
+					continue;
+				}
+
+				RandomAmountOutputs output_mix_outs = pop_index(mix_outs_from_server, j);
+
+				// if we need to retry constructing tx, will remember to use same mix outs for this out on subsequent attempt(s)
+				prior_attempt_unspent_outs_to_mix_outs_new[out.public_key] = output_mix_outs.outputs;
+				mix_outs.push_back(std::move(output_mix_outs));
+
+				break;
+			}
+		} else {
+			RandomAmountOutputs output_mix_outs;
+			output_mix_outs.outputs = prior_attempt_unspent_outs_to_mix_outs_new[out.public_key];
+			output_mix_outs.amount = out.amount;
+			mix_outs.push_back(std::move(output_mix_outs));
+		}
+	}
+
+	// we expect to have a set of mix outs for every output in the tx
+	if (mix_outs.size() != using_outs.size()) {
+		retVals.errCode = notEnoughUsableDecoysFound;
+		return;
+	}
+
+	// we expect to use up all mix outs returned by the server
+	if (!mix_outs_from_server.empty()) {
+		retVals.errCode = tooManyDecoysRemaining;
+		return;
+	}
+
+	retVals.mix_outs = std::move(mix_outs);
+	retVals.prior_attempt_unspent_outs_to_mix_outs_new = std::move(prior_attempt_unspent_outs_to_mix_outs_new);
+}
+
 void monero_transfer_utils::send_step2__try_create_transaction(
 	Send_Step2_RetVals &retVals,
 	//
@@ -366,7 +447,6 @@ void monero_transfer_utils::send_step2__try_create_transaction(
 	uint64_t fee_per_b, // per v8
 	uint64_t fee_quantization_mask,
 	vector<RandomAmountOutputs> &mix_outs, // cannot be const due to convenience__create_transaction's mutability requirement
-	uint32_t subaddresses_count,
 	use_fork_rules_fn_type use_fork_rules_fn,
 	uint64_t unlock_time, // or 0
 	cryptonote::network_type nettype
@@ -381,7 +461,6 @@ void monero_transfer_utils::send_step2__try_create_transaction(
 		to_address_string, payment_id_string,
 		final_total_wo_fee, change_amount, fee_amount,
 		using_outs, mix_outs,
-		subaddresses_count,
 		use_fork_rules_fn,
 		unlock_time,
 		nettype // TODO: move to after from_address_string
@@ -420,12 +499,12 @@ void monero_transfer_utils::create_transaction(
 	const account_keys& sender_account_keys, // this will reference a particular hw::device
 	const uint32_t subaddr_account_idx,
 	const std::unordered_map<crypto::public_key, cryptonote::subaddress_index> &subaddresses,
-	const address_parse_info &to_addr,
+	const address_parse_info &to_addr, 
 	uint64_t sending_amount,
 	uint64_t change_amount,
 	uint64_t fee_amount,
 	const vector<SpendableOutput> &outputs,
-	vector<RandomAmountOutputs> &mix_outs,
+	vector<RandomAmountOutputs> &mix_outs, 
 	const std::vector<uint8_t> &extra,
 	use_fork_rules_fn_type use_fork_rules_fn,
 	uint64_t unlock_time, // or 0
@@ -437,16 +516,15 @@ void monero_transfer_utils::create_transaction(
 	// TODO: do we need to sort destinations by amount, here, according to 'decompose_destinations'?
 	//
 	uint32_t fake_outputs_count = fixed_mixinsize();
-	bool bulletproof = true;
-	rct::RangeProofType range_proof_type = bulletproof ? rct::RangeProofPaddedBulletproof : rct::RangeProofBorromean;
-
-	int bp_version = 0;
-	if (bulletproof) {
-		if (use_fork_rules_fn(HF_VERSION_CLSAG, -10)) bp_version = 3;
-		else if (use_fork_rules_fn(HF_VERSION_SMALLER_BP, -10)) bp_version = 2;
-		else bp_version = 1;
+	rct::RangeProofType range_proof_type = rct::RangeProofPaddedBulletproof;
+	int bp_version = 1;
+	if (use_fork_rules_fn(HF_VERSION_BULLETPROOF_PLUS, -10)) {
+		bp_version = 4;
+	} else if (use_fork_rules_fn(HF_VERSION_CLSAG, -10)) {
+		bp_version = 3;
+	} else if (use_fork_rules_fn(HF_VERSION_SMALLER_BP, -10)) {
+		bp_version = 2;
 	}
-
 	const rct::RCTConfig rct_config {
 		range_proof_type,
 		bp_version,
@@ -572,17 +650,6 @@ void monero_transfer_utils::create_transaction(
 		src.real_out_tx_key = tx_pub_key;
 		//
 		src.real_out_additional_tx_keys = get_additional_tx_pub_keys_from_extra(extra);
-
-		for (const auto& additional_pub_str : outputs[out_index].additional_tx_pubs) {
-			crypto::public_key additional_pub;
-			if (!epee::string_tools::hex_to_pod(additional_pub_str, additional_pub)) {
-				retVals.errCode = givenAnInvalidPubKey;
-				return;
-			}
-
-			src.real_out_additional_tx_keys.push_back(additional_pub);
-		}
-
 		//
 		src.real_output = real_output_index;
 		uint64_t internal_output_index = outputs[out_index].index;
@@ -590,27 +657,19 @@ void monero_transfer_utils::create_transaction(
 		//
 		src.rct = outputs[out_index].rct != boost::none && (*(outputs[out_index].rct)).empty() == false;
 		if (src.rct) {
-			if (!outputs[out_index].mask.empty()) {
-				if (!string_tools::hex_to_pod(outputs[out_index].mask, src.mask)) {
-					retVals.errCode = mixRCTOutsMissingCommit;
-					return;
-				}
-			} else {
-				rct::key decrypted_mask;
-				bool r = _rct_hex_to_decrypted_mask(
-					*(outputs[out_index].rct),
-					sender_account_keys.m_view_secret_key,
-					tx_pub_key,
-					internal_output_index,
-					decrypted_mask
-				);
-				if (!r) {
-					retVals.errCode = cantGetDecryptedMaskFromRCTHex;
-					return;
-				}
-				src.mask = decrypted_mask;
+			rct::key decrypted_mask;
+			bool r = _rct_hex_to_decrypted_mask(
+				*(outputs[out_index].rct),
+				sender_account_keys.m_view_secret_key,
+				tx_pub_key,
+				internal_output_index,
+				decrypted_mask
+			);
+			if (!r) {
+				retVals.errCode = cantGetDecryptedMaskFromRCTHex;
+				return;
 			}
-
+			src.mask = decrypted_mask;
 //			rct::key calculated_commit = rct::commit(outputs[out_index].amount, decrypted_mask);
 //			rct::key parsed_commit;
 //			_rct_hex_to_rct_commit(*(outputs[out_index].rct), parsed_commit);
@@ -673,8 +732,7 @@ void monero_transfer_utils::create_transaction(
 		sender_account_keys, subaddresses,
 		sources, splitted_dsts, change_dst.addr, extra,
 		tx, unlock_time, tx_key, additional_tx_keys,
-		true, rct_config,
-		/*m_multisig ? &msout : */NULL
+		true, rct_config, true
 	);
 	LOG_PRINT_L2("constructed tx, r="<<r);
 	if (!r) {
@@ -687,8 +745,8 @@ void monero_transfer_utils::create_transaction(
 		retVals.errCode = transactionTooBig;
 		return;
 	}
-	bool use_bulletproofs = !tx.rct_signatures.p.bulletproofs.empty();
-	THROW_WALLET_EXCEPTION_IF(use_bulletproofs != bulletproof, error::wallet_internal_error, "Expected tx use_bulletproofs to equal bulletproof flag");
+	bool use_bulletproofs = !tx.rct_signatures.p.bulletproofs.empty() || !tx.rct_signatures.p.bulletproofs_plus.empty();
+	THROW_WALLET_EXCEPTION_IF(use_bulletproofs != true, error::wallet_internal_error, "Expected tx use_bulletproofs to equal bulletproof flag");
 	//
 	retVals.tx = tx;
 	retVals.tx_key = tx_key;
@@ -707,7 +765,6 @@ void monero_transfer_utils::convenience__create_transaction(
 	uint64_t fee_amount,
 	const vector<SpendableOutput> &outputs,
 	vector<RandomAmountOutputs> &mix_outs,
-	uint32_t subaddresses_count,
 	use_fork_rules_fn_type use_fork_rules_fn,
 	uint64_t unlock_time,
 	network_type nettype
@@ -768,12 +825,10 @@ void monero_transfer_utils::convenience__create_transaction(
 		}
 		payment_id_seen = true;
 	}
-	uint32_t subaddr_account_idx = 0; // unused
-
+	//
+	uint32_t subaddr_account_idx = 0;
 	std::unordered_map<crypto::public_key, cryptonote::subaddress_index> subaddresses;
-	cryptonote::subaddress_index index = {0, 0};
-	serial_bridge::expand_subaddresses(account_keys, subaddresses, index, subaddresses_count);
-
+	subaddresses[account_keys.m_account_address.m_spend_public_key] = {0,0};
 	//
 	TransactionConstruction_RetVals actualCall_retVals;
 	create_transaction(
@@ -818,6 +873,6 @@ void monero_transfer_utils::convenience__create_transaction(
 	//
 //	cout << "out 0: " << string_tools::pod_to_hex(boost::get<txout_to_key>((*(actualCall_retVals.tx)).vout[0].target).key) << endl;
 //	cout << "out 1: " << string_tools::pod_to_hex(boost::get<txout_to_key>((*(actualCall_retVals.tx)).vout[1].target).key) << endl;
-	//
+	//	
 	retVals.txBlob_byteLength = txBlob_byteLength;
 }
