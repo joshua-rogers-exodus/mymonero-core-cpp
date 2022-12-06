@@ -46,6 +46,7 @@
 #include "wallet_errors.h"
 #include "string_tools.h"
 #include "ringct/rctSigs.h"
+#include "common/threadpool.h"
 #include "storages/portable_storage_template_helper.h"
 //
 #include "serial_bridge_utils.hpp"
@@ -465,16 +466,8 @@ std::vector<Output> serial_bridge::get_outputs(const cryptonote::transaction &tx
 		Output output;
 		output.index = i;
 		output.amount = std::to_string(tx_out.amount);
-
-		if (tx_out.target.type() == typeid(cryptonote::txout_to_key)) {
-			const auto &target = boost::get<cryptonote::txout_to_key>(tx_out.target);
-			output.pub = target.key;
-		} else if (tx_out.target.type() == typeid(cryptonote::txout_to_tagged_key)) {
-			const auto &target = boost::get<cryptonote::txout_to_tagged_key>(tx_out.target);
-			output.pub = target.key;
-		} else {
-			continue;
-		}
+		crypto::public_key output_public_key;
+		if (!cryptonote::get_output_public_key(tx_out, output_public_key)) continue;
 		output.view_tag = cryptonote::get_output_view_tag(tx_out);
 		outputs.push_back(output);
 	}
@@ -531,6 +524,11 @@ BridgeTransaction serial_bridge::json_to_tx(boost::property_tree::ptree tx_desc)
 
 	tx.id = tx_desc.get<string>("id");
 
+	optional<string> str = tx_desc.get_optional<string>("pub");
+	if (str == none) {
+		throw std::invalid_argument("Missing 'tx_desc.pub'");
+	}
+	
 	if (!epee::string_tools::hex_to_pod(tx_desc.get<string>("pub"), tx.pub)) {
 		throw std::invalid_argument("Invalid 'tx_desc.pub'");
 	}
@@ -611,6 +609,13 @@ BridgeTransaction serial_bridge::json_to_tx(boost::property_tree::ptree tx_desc)
 
 		output.amount = output_desc.second.get<string>("amount");
 
+		crypto::view_tag view_tag = crypto::view_tag{};
+		auto viewTagString = output_desc.second.get_optional<string>("view_tag");
+		if (viewTagString) {
+			bool r = epee::string_tools::hex_to_pod(std::string(*viewTagString), view_tag);
+			THROW_WALLET_EXCEPTION_IF(!r, error::wallet_internal_error, "Invalid 'tx_desc.outputs.view_tag'");
+		}
+		output.view_tag = view_tag;
 		tx.outputs.push_back(output);
 	}
 
@@ -726,8 +731,8 @@ std::vector<Utxo> serial_bridge::extract_utxos_from_tx(BridgeTransaction tx, cry
 		additional_derivations.push_back(additional_derivation);
 	}
 
-	BOOST_FOREACH (auto &output, tx.outputs) {
-		boost::optional<subaddress_receive_info> subaddr_recv_info = is_out_to_acc_precomp(subaddresses, output.pub, derivation, additional_derivations, output.index, hwdev);
+	BOOST_FOREACH (Output &output, tx.outputs) {
+		boost::optional<subaddress_receive_info> subaddr_recv_info = is_out_to_acc_precomp(subaddresses, output.pub, derivation, additional_derivations, output.index, hwdev, output.view_tag);
 		if (!subaddr_recv_info) continue;
 
 		Utxo utxo;
@@ -798,24 +803,37 @@ ExtractUtxosResponse serial_bridge::extract_utxos_raw(const string &args_string)
 		response.results_by_wallet_account.insert(std::make_pair(pair.first, ExtractUtxosResult{}));
 	}
 
-	for (const auto& tx_desc : json_root.get_child("txs")) {
-		assert(tx_desc.first.empty());
+	tools::threadpool& tpool = tools::threadpool::getInstance();
+  	tools::threadpool::waiter waiter(tpool);
+	struct geniod_params
+	{
+		const BridgeTransaction &tx;
+	};
 
-		BridgeTransaction tx;
-		try {
-			tx = serial_bridge::json_to_tx(tx_desc.second);
-		} catch(std::invalid_argument err) {
-			continue;
-		}
-
+	auto geniod = [&](const BridgeTransaction &tx) {
 		for (auto& pair : wallet_accounts_params) {
 			auto tx_utxos = serial_bridge::extract_utxos_from_tx(tx, pair.second.account_keys, pair.second.subaddresses);
 
 			auto &result = response.results_by_wallet_account[pair.first];
 			result.utxos.insert(std::end(result.utxos), std::begin(tx_utxos), std::end(tx_utxos));
 		}
+	};
+
+	for (const auto& tx_desc : json_root.get_child("txs")) {
+		assert(tx_desc.first.empty());
+
+		BridgeTransaction tx;
+		try {
+			tx = serial_bridge::json_to_tx(tx_desc.second);
+
+			// submitting geniod function calls to the thread pool
+			tpool.submit(&waiter, [&, tx](){ geniod(tx); }, true);
+		} catch(std::invalid_argument err) {
+			continue;
+		}
 	}
 
+	THROW_WALLET_EXCEPTION_IF(!waiter.wait(), error::wallet_internal_error, "Exception in thread pool");
 
 	for (const auto& pair : wallet_accounts_params) {
 		auto &result = response.results_by_wallet_account[pair.first];
